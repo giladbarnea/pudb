@@ -6,6 +6,7 @@ Output Format
 - Preserves type wrappers and punctuation (quotes, (), [], {}, <>).
 - Shortens inner content with `...` (middle-ellipsis), not at boundaries.
 - Containers cap items with `...`; depth is limited; cycles print `...`.
+ - Global `max_length` caps the final string; per-leaf shortening budget is derived from measured depth; top-level is re-capped to `max_length`.
 
 Handled Objects
 - Primitives: `None`, bool, numbers.

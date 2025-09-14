@@ -8,9 +8,14 @@ from collections import namedtuple
 from collections.abc import Mapping
 from typing import Any
 
+import sys
+
+VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
+
 # Optional Pydantic support
 try:
     from pydantic import BaseModel as _PydanticBaseModel  # type: ignore
+
     try:
         from pydantic import ValidationError as _PydanticValidationError  # type: ignore
     except Exception:  # pragma: no cover
@@ -43,7 +48,9 @@ def _short_bytes_keep_prefix(b: bytes, max_len: int) -> str:
     return "b" + repr(inner)
 
 
-def _short_path(p: pathlib.PurePath, max_len: int, keep_last_segment: bool = False) -> str:
+def _short_path(
+    p: pathlib.PurePath, max_len: int, keep_last_segment: bool = False
+) -> str:
     parts = p.parts
     if len(parts) <= 2:
         inner = str(p)
@@ -53,7 +60,9 @@ def _short_path(p: pathlib.PurePath, max_len: int, keep_last_segment: bool = Fal
             if keep_last_segment and len(parts) >= 2:
                 inner = f"{parts[0]}/{parts[1]}/.../{parts[-1]}".replace("//", "/")
             else:
-                inner = f"{parts[0]}/{parts[1] if len(parts) > 1 else ''}/...".replace("//", "/")
+                inner = f"{parts[0]}/{parts[1] if len(parts) > 1 else ''}/...".replace(
+                    "//", "/"
+                )
         else:
             if keep_last_segment:
                 inner = f"{parts[0]}/.../{parts[-1]}"
@@ -81,14 +90,146 @@ def _short_angle_brackets(s: str, max_inner_len: int = 16) -> str:
     return f"<{_truncate_middle(inner, max_inner_len)}...>"
 
 
+def _cap_root(s: str, *, max_length: int, depth: int) -> str:
+    if depth == 0 and len(s) > max_length:
+        return _truncate_middle(s, max_length)
+    return s
+
+
+def _measure_depth(
+    obj: Any,
+    *,
+    max_depth: int,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> int:
+    if _seen is None:
+        _seen = set()
+    oid = id(obj)
+    if oid in _seen:
+        return 0
+    _seen.add(oid)
+
+    if _depth >= max_depth:
+        return 0
+
+    # Terminal types
+    if obj is None or isinstance(
+        obj,
+        (bool, int, float, complex, str, bytes, bytearray, enum.Enum, pathlib.PurePath),
+    ):
+        return 0
+    if isinstance(
+        obj,
+        (
+            types.FunctionType,
+            types.BuiltinFunctionType,
+            types.MethodType,
+            types.BuiltinMethodType,
+            types.ModuleType,
+        ),
+    ):
+        return 0
+
+    # Dataclass
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        depths = []
+        for f in dataclasses.fields(obj):
+            try:
+                v = getattr(obj, f.name)
+            except Exception:
+                continue
+            depths.append(
+                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
+            )
+        return 1 + (max(depths) if depths else 0)
+
+    # Pydantic BaseModel
+    if _HAVE_PYDANTIC and isinstance(obj, _PydanticBaseModel):  # type: ignore[arg-type]
+        cls_type = type(obj)
+        if hasattr(cls_type, "model_fields"):
+            names = list(cls_type.model_fields.keys())
+        elif hasattr(cls_type, "__fields__"):
+            names = list(cls_type.__fields__.keys())
+        else:
+            names = []
+        depths = []
+        for name in names:
+            try:
+                v = getattr(obj, name)
+            except Exception:
+                continue
+            depths.append(
+                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
+            )
+        return 1 + (max(depths) if depths else 0)
+
+    # Namedtuple
+    if _is_namedtuple(obj):
+        depths = []
+        for name in getattr(obj, "_fields", []):
+            try:
+                v = getattr(obj, name)
+            except Exception:
+                continue
+            depths.append(
+                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
+            )
+        return 1 + (max(depths) if depths else 0)
+
+    # Mapping
+    if isinstance(obj, Mapping):
+        depths = []
+        for _, v in obj.items():
+            depths.append(
+                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
+            )
+        return 1 + (max(depths) if depths else 0)
+
+    # Sequences
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        depths = []
+        for v in obj:
+            depths.append(
+                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
+            )
+        return 1 + (max(depths) if depths else 0)
+
+    return 0
+
+
+if VERBOSE:
+    import time
+
+    from functools import wraps
+
+    def print_input_output(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            top_call: bool = kwargs.get('_depth', 0) == 0
+            top_call and print(f"Input:  {args}, {kwargs}")
+            result = fn(*args, **kwargs)
+            top_call and print(f"Output: {result}\n")
+            top_call and time.sleep(0.05)
+            return result
+
+        return wrapper
+else:
+
+    def print_input_output(fn):
+        return fn
+
+
+@print_input_output
 def pudb_stringifier(
     obj: Any,
     *,
-    max_str: int = 40,
+    max_length: int = 160,
     max_items: int = 4,
     max_depth: int = 3,
     _depth: int = 0,
     _seen: set[int] | None = None,
+    _measured_depth: int | None = None,
 ) -> str:
     # Cycle protection
     if _seen is None:
@@ -98,28 +239,60 @@ def pudb_stringifier(
         return "..."
     _seen.add(oid)
 
+    # Compute measured depth once at root; derive leaf budget
+    if _measured_depth is None and _depth == 0:
+        try:
+            _measured_depth = _measure_depth(obj, max_depth=max_depth)
+        except Exception:
+            _measured_depth = 0
+    elif _measured_depth is None:
+        _measured_depth = 0
+
+    leaf_width = max(
+        8, max_length // (_measured_depth + 1 if _measured_depth is not None else 1)
+    )
+
     # Depth cap
     if _depth >= max_depth:
         r = repr(obj)
-        return _short_angle_brackets(r) if (r.startswith("<") and r.endswith(">")) else _truncate_middle(r, 40)
+        part = (
+            _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
+            if (r.startswith("<") and r.endswith(">"))
+            else _truncate_middle(r, leaf_width)
+        )
+        if _depth == 0 and len(part) > max_length:
+            part = _truncate_middle(part, max_length)
+        return part
 
     # Primitives
     if obj is None or isinstance(obj, (bool, int, float, complex)):
-        return repr(obj)
+        return _cap_root(repr(obj), max_length=max_length, depth=_depth)
 
     # Strings / bytes
     if isinstance(obj, str):
-        return _short_str_keep_quotes(obj, max_str)
+        return _cap_root(
+            _short_str_keep_quotes(obj, leaf_width), max_length=max_length, depth=_depth
+        )
     if isinstance(obj, (bytes, bytearray)):
-        return _short_bytes_keep_prefix(bytes(obj), max_str)
+        return _cap_root(
+            _short_bytes_keep_prefix(bytes(obj), leaf_width),
+            max_length=max_length,
+            depth=_depth,
+        )
 
     # Paths
     if isinstance(obj, pathlib.PurePath):
-        return _short_path(obj, max_str, keep_last_segment=False)
+        return _cap_root(
+            _short_path(obj, leaf_width, keep_last_segment=False),
+            max_length=max_length,
+            depth=_depth,
+        )
 
     # Enums
     if isinstance(obj, enum.Enum):
-        return f"<{type(obj).__name__}...>"
+        return _cap_root(
+            f"<{type(obj).__name__}...>", max_length=max_length, depth=_depth
+        )
 
     # Functions/methods/modules (angle-bracket-y reprs)
     if isinstance(
@@ -132,7 +305,11 @@ def pudb_stringifier(
             types.ModuleType,
         ),
     ):
-        return _short_angle_brackets(repr(obj))
+        return _cap_root(
+            _short_angle_brackets(repr(obj), max_inner_len=max(8, leaf_width // 2)),
+            max_length=max_length,
+            depth=_depth,
+        )
 
     # Dataclasses
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -147,15 +324,16 @@ def pudb_stringifier(
                 f"{f.name}="
                 + pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
         inner = ", ".join(parts)
-        return f"{cls}({inner})"
+        return _cap_root(f"{cls}({inner})", max_length=max_length, depth=_depth)
 
     # Namedtuple
     if _is_namedtuple(obj):
@@ -167,14 +345,17 @@ def pudb_stringifier(
                 f"{name}="
                 + pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
-        return f"{cls}(" + ", ".join(parts) + ")"
+        return _cap_root(
+            f"{cls}(" + ", ".join(parts) + ")", max_length=max_length, depth=_depth
+        )
 
     # Pydantic BaseModel (v1 and v2)
     if _HAVE_PYDANTIC and isinstance(obj, _PydanticBaseModel):  # type: ignore[arg-type]
@@ -197,18 +378,23 @@ def pudb_stringifier(
                 f"{name}="
                 + pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
         inner = ", ".join(parts)
         return f"{cls}({inner})"
 
     # Pydantic ValidationError summary
-    if _HAVE_PYDANTIC and _PydanticValidationError is not None and isinstance(obj, _PydanticValidationError):  # type: ignore[arg-type]
+    if (
+        _HAVE_PYDANTIC
+        and _PydanticValidationError is not None
+        and isinstance(obj, _PydanticValidationError)
+    ):  # type: ignore[arg-type]
         n = 0
         try:
             errs = obj.errors()  # list-like
@@ -226,22 +412,26 @@ def pudb_stringifier(
                 break
             ks = pudb_stringifier(
                 k,
-                max_str=max_str,
+                max_length=max_length,
                 max_items=max_items,
                 max_depth=max_depth,
                 _depth=_depth + 1,
                 _seen=_seen,
+                _measured_depth=_measured_depth,
             )
             vs = pudb_stringifier(
                 v,
-                max_str=max_str,
+                max_length=max_length,
                 max_items=max_items,
                 max_depth=max_depth,
                 _depth=_depth + 1,
                 _seen=_seen,
+                _measured_depth=_measured_depth,
             )
             items.append(f"{ks}: {vs}")
-        return "{" + ", ".join(items) + "}"
+        return _cap_root(
+            "{" + ", ".join(items) + "}", max_length=max_length, depth=_depth
+        )
 
     # Sequences (but not str/bytes already handled)
     if isinstance(obj, list):
@@ -253,14 +443,17 @@ def pudb_stringifier(
             parts.append(
                 pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
-        return "[" + ", ".join(parts) + "]"
+        return _cap_root(
+            "[" + ", ".join(parts) + "]", max_length=max_length, depth=_depth
+        )
 
     if isinstance(obj, tuple):
         seq = list(obj)
@@ -272,15 +465,18 @@ def pudb_stringifier(
             parts.append(
                 pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
         trailing = "," if len(seq) == 1 else ""
-        return "(" + ", ".join(parts) + trailing + ")"
+        return _cap_root(
+            "(" + ", ".join(parts) + trailing + ")", max_length=max_length, depth=_depth
+        )
 
     if isinstance(obj, set):
         if len(obj) == 0:
@@ -294,14 +490,17 @@ def pudb_stringifier(
             parts.append(
                 pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
-        return "{" + ", ".join(parts) + "}"
+        return _cap_root(
+            "{" + ", ".join(parts) + "}", max_length=max_length, depth=_depth
+        )
 
     if isinstance(obj, frozenset):
         if len(obj) == 0:
@@ -315,20 +514,28 @@ def pudb_stringifier(
             parts.append(
                 pudb_stringifier(
                     v,
-                    max_str=max_str,
+                    max_length=max_length,
                     max_items=max_items,
                     max_depth=max_depth,
                     _depth=_depth + 1,
                     _seen=_seen,
+                    _measured_depth=_measured_depth,
                 )
             )
-        return "frozenset({" + ", ".join(parts) + "})"
+        return _cap_root(
+            "frozenset({" + ", ".join(parts) + "})", max_length=max_length, depth=_depth
+        )
 
     # Fallback
     r = repr(obj)
-    if r.startswith("<") and r.endswith(">"):
-        return _short_angle_brackets(r)
-    return _truncate_middle(r, 80)
+    part = (
+        _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
+        if (r.startswith("<") and r.endswith(">"))
+        else _truncate_middle(r, leaf_width)
+    )
+    if _depth == 0 and len(part) > max_length:
+        part = _truncate_middle(part, max_length)
+    return part
 
 
 def run_test() -> None:
@@ -364,7 +571,7 @@ def run_test() -> None:
     assert md.startswith("{") and "..." in md, md
 
     # 4) Bytes
-    b = pudb_stringifier(b"abcdefghijklmnopqrstuvwxyz", max_str=8)
+    b = pudb_stringifier(b"abcdefghijklmnopqrstuvwxyz", max_length=16)
     assert b.startswith("b'"), b
 
     # 5) Cycles
@@ -376,11 +583,11 @@ def run_test() -> None:
     # 6) Namedtuple
     Point = namedtuple("Point", ["x", "y"])
     pt = Point("hello" * 20, 123)
-    nt = pudb_stringifier(pt, max_str=10)
+    nt = pudb_stringifier(pt, max_length=20)
     assert nt.startswith("Point(") and "x='hellohe...".split()[0] or True
 
     print("All tests passed.")
-    
+
     # 7) Empty set and frozenset, tuple singleton
     assert pudb_stringifier(set()) == "set()"
     fs = pudb_stringifier(frozenset())
@@ -395,6 +602,7 @@ def run_test() -> None:
 
     # 9) range
     import datetime as _dt
+
     r = pudb_stringifier(range(0, 1000))
     assert r.startswith("range("), r
 
@@ -404,8 +612,9 @@ def run_test() -> None:
 
     # 11) regex pattern
     import re as _re
+
     pat = _re.compile("a" * 100)
-    rp = pudb_stringifier(pat, max_str=10)
+    rp = pudb_stringifier(pat, max_length=20)
     assert "re.compile(" in rp and "..." in rp, rp
 
     # 12) module
@@ -416,6 +625,7 @@ def run_test() -> None:
     def _gen():
         for i in range(100):
             yield i
+
     g = _gen()
     gg = pudb_stringifier(g)
     assert gg.startswith("<generator") and gg.endswith(">"), gg
@@ -426,46 +636,51 @@ def run_test() -> None:
 
     # 15) Exception with long message
     e = ValueError("x" * 100)
-    es = pudb_stringifier(e, max_str=10)
+    es = pudb_stringifier(e, max_length=20)
     assert es.startswith("ValueError(") and "..." in es, es
 
     # 16) Decimal
     from decimal import Decimal
-    dec = pudb_stringifier(Decimal("123456789.123456789"), max_str=8)
+
+    dec = pudb_stringifier(Decimal("123456789.123456789"), max_length=20)
     assert dec.startswith("Decimal("), dec
 
     # 17) SimpleNamespace
     from types import SimpleNamespace
+
     ns = pudb_stringifier(SimpleNamespace(a=1, b=2))
     assert "namespace(" in ns, ns
 
     # 18) OrderedDict truncation
     from collections import OrderedDict
-    od = OrderedDict((
-        ("a", 1), ("b", 2), ("c", 3), ("d", 4)
-    ))
+
+    od = OrderedDict((("a", 1), ("b", 2), ("c", 3), ("d", 4)))
     ods = pudb_stringifier(od, max_items=2)
     assert ods.startswith("{") and ods.endswith("}") and "..." in ods, ods
 
     # 19) Class object and angle-bracket repr shortening
-    class C: 
+    class C:
         pass
+
     cls = pudb_stringifier(C)
     assert cls.startswith("<class") and cls.endswith(">"), cls
 
     class Angle:
         def __repr__(self):
             return "<Angle foo bar baz>"
+
     ang = pudb_stringifier(Angle())
     assert ang.startswith("<Angle") and ang.endswith("...>"), ang
 
     # 20) Pydantic BaseModel (if available)
     try:
         from pydantic import BaseModel
+
         have_pyd = True
     except Exception:
         have_pyd = False
     if have_pyd:
+
         class Address(BaseModel):
             city: str
             path: pathlib.PurePosixPath
@@ -492,15 +707,18 @@ def run_test() -> None:
 
         # Field / FieldInfo object
         from pydantic import Field
+
         fi = Field(default="x" * 200, description="desc" * 100)
-        fi_s = pudb_stringifier(fi, max_str=16)
+        fi_s = pudb_stringifier(fi, max_length=40)
         assert "FieldInfo(" in fi_s or "ModelField(" in fi_s, fi_s
 
         # RootModel (pydantic v2)
         try:
             from pydantic import RootModel  # type: ignore
+
             class Items(RootModel[list[int]]):
                 pass
+
             items = Items([1, 2, 3, 4, 5, 6])
             ims = pudb_stringifier(items, max_items=3)
             assert ims.startswith("Items(") and "..." in ims, ims
@@ -510,6 +728,7 @@ def run_test() -> None:
         # SecretStr
         try:
             from pydantic import SecretStr
+
             ss = SecretStr("supersecret-value-that-is-very-long")
             ss_s = pudb_stringifier(ss)
             assert ss_s.startswith("SecretStr("), ss_s
@@ -519,21 +738,41 @@ def run_test() -> None:
         # ValidationError
         class M(BaseModel):
             x: int
+
         try:
             M(x="not-an-int")
         except Exception as ve:  # pydantic.ValidationError
             ve_s = pudb_stringifier(ve)
-            assert ve_s.startswith("<ValidationError ") and ve_s.endswith(" errors>"), ve_s
+            assert ve_s.startswith("<ValidationError ") and ve_s.endswith(" errors>"), (
+                ve_s
+            )
 
         # TypeAdapter AnyUrl (v2)
         try:
             from pydantic import TypeAdapter, AnyUrl
+
             ta = TypeAdapter(AnyUrl)
-            url = ta.validate_python("https://example.com/this/is/a/very/long/path/component")
-            url_s = pudb_stringifier(url, max_str=20)
+            url = ta.validate_python(
+                "https://example.com/this/is/a/very/long/path/component"
+            )
+            url_s = pudb_stringifier(url, max_length=30)
             assert url_s.startswith("'") and url_s.endswith("'"), url_s
         except Exception:
             pass
+
+    # 21) Global max_length budget tests
+    # Flat object: long string must be capped to <= max_length
+    max_len_flat = 50
+    flat = pudb_stringifier("x" * 1000, max_length=max_len_flat)
+    assert len(flat) <= max_len_flat, (len(flat), flat)
+    assert flat.startswith("'") and flat.endswith("'"), flat
+
+    # Recursive depth 4: nested mappings; ensure total length <= max_length
+    nested = {"a": {"b": {"c": {"d": "y" * 500}}}}
+    max_len_deep = 80
+    deep_s = pudb_stringifier(nested, max_length=max_len_deep, max_depth=10)
+    assert len(deep_s) <= max_len_deep, (len(deep_s), deep_s)
+    assert deep_s[0] == "{" and deep_s[-1] == "}", deep_s
 
 
 if __name__ == "__main__":
