@@ -84,7 +84,7 @@ def _short_angle_brackets(s: str, max_inner_len: int = 16) -> str:
 def pudb_stringifier(
     obj: Any,
     *,
-    max_str: int = 32,
+    max_str: int = 40,
     max_items: int = 4,
     max_depth: int = 3,
     _depth: int = 0,

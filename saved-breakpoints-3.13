@@ -1,7 +1,5 @@
+b /Users/giladbarnea/dev/bashscripts/prin/tests/test_website_adapter_all_urls.py:117
+b /Users/giladbarnea/dev/bashscripts/prin/tests/test_website_adapter_all_urls.py:85
 b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:58
-b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:80
-b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:70
-b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:65
-b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:57
-b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:69
-b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:81
+b /Users/giladbarnea/dev/bashscripts/prin/tests/test_website_adapter_all_urls.py:110
+b /Users/giladbarnea/dev/bashscripts/prin/src/prin/filters.py:80, 'adv' in self._u or 'adv' in name
