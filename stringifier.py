@@ -11,6 +11,7 @@ from typing import Any
 import sys
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
+VERY_VERBOSE = "-vv" in sys.argv or "--very-verbose" in sys.argv
 
 # Optional Pydantic support
 try:
@@ -51,24 +52,8 @@ def _short_bytes_keep_prefix(b: bytes, max_len: int) -> str:
 def _short_path(
     p: pathlib.PurePath, max_len: int, keep_last_segment: bool = False
 ) -> str:
-    parts = p.parts
-    if len(parts) <= 2:
-        inner = str(p)
-    else:
-        if p.is_absolute():
-            # Keep root + first dir; show ellipsis; optionally keep last
-            if keep_last_segment and len(parts) >= 2:
-                inner = f"{parts[0]}/{parts[1]}/.../{parts[-1]}".replace("//", "/")
-            else:
-                inner = f"{parts[0]}/{parts[1] if len(parts) > 1 else ''}/...".replace(
-                    "//", "/"
-                )
-        else:
-            if keep_last_segment:
-                inner = f"{parts[0]}/.../{parts[-1]}"
-            else:
-                inner = f"{parts[0]}/..."
-    inner = _truncate_middle(inner, max_len)
+    s = str(p)
+    inner = s if len(s) <= max_len else _truncate_middle(s, max_len)
     return f"{type(p).__name__}(" + repr(inner) + ")"
 
 
@@ -94,6 +79,29 @@ def _cap_root(s: str, *, max_length: int, depth: int) -> str:
     if depth == 0 and len(s) > max_length:
         return _truncate_middle(s, max_length)
     return s
+
+
+def _is_acyclic_primitive(obj: Any) -> bool:
+    return obj is None or isinstance(
+        obj,
+        (
+            bool,
+            int,
+            float,
+            complex,
+            str,
+            bytes,
+            bytearray,
+            enum.Enum,
+            pathlib.PurePath,
+            range,
+            types.FunctionType,
+            types.BuiltinFunctionType,
+            types.MethodType,
+            types.BuiltinMethodType,
+            types.ModuleType,
+        ),
+    )
 
 
 def _measure_depth(
@@ -198,7 +206,7 @@ def _measure_depth(
     return 0
 
 
-if VERBOSE:
+if VERBOSE or VERY_VERBOSE:
     import time
 
     from functools import wraps
@@ -206,11 +214,23 @@ if VERBOSE:
     def print_input_output(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            top_call: bool = kwargs.get('_depth', 0) == 0
-            top_call and print(f"Input:  {args}, {kwargs}")
+            depth = kwargs.get("_depth", 0)
+            indent = " " + ("· " * depth) if depth else ""
+            if depth == 0 and (VERBOSE or VERY_VERBOSE):
+                time.sleep(0.01)
+                prefix = "[root] " if VERY_VERBOSE else ""
+                print(f"{prefix}Input:  {args}, {kwargs}    ({len(repr(args[0]))=})")
+            if depth > 0 and VERY_VERBOSE:
+                time.sleep(0.01)
+                print(f"{indent}Input:  {args}, {kwargs}")
             result = fn(*args, **kwargs)
-            top_call and print(f"Output: {result}\n")
-            top_call and time.sleep(0.05)
+            if depth == 0 and (VERBOSE or VERY_VERBOSE):
+                time.sleep(0.01)
+                prefix = "[root] " if VERY_VERBOSE else ""
+                print(f"{prefix}Output: {result}    ({len(result)=})\n")
+            if depth > 0 and VERY_VERBOSE:
+                time.sleep(0.01)
+                print(f"{indent}Output: {result}")
             return result
 
         return wrapper
@@ -220,7 +240,6 @@ else:
         return fn
 
 
-@print_input_output
 def pudb_stringifier(
     obj: Any,
     *,
@@ -230,312 +249,429 @@ def pudb_stringifier(
     _depth: int = 0,
     _seen: set[int] | None = None,
     _measured_depth: int | None = None,
+    _no_leaf_shorten: bool = False,
+    _leaf_max: int | None = None,
+    _driver: bool = True,
 ) -> str:
-    # Cycle protection
-    if _seen is None:
-        _seen = set()
-    oid = id(obj)
-    if oid in _seen:
-        return "..."
-    _seen.add(oid)
-
-    # Compute measured depth once at root; derive leaf budget
-    if _measured_depth is None and _depth == 0:
-        try:
-            _measured_depth = _measure_depth(obj, max_depth=max_depth)
-        except Exception:
-            _measured_depth = 0
-    elif _measured_depth is None:
-        _measured_depth = 0
-
-    leaf_width = max(
-        8, max_length // (_measured_depth + 1 if _measured_depth is not None else 1)
-    )
-
-    # Depth cap
-    if _depth >= max_depth:
-        r = repr(obj)
-        part = (
-            _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
-            if (r.startswith("<") and r.endswith(">"))
-            else _truncate_middle(r, leaf_width)
+    # Root orchestrator: try full render, else binary-search leaf budgets
+    if _driver and _depth == 0:
+        full = pudb_stringifier(
+            obj,
+            max_length=10**9,
+            max_items=max_items,
+            max_depth=max_depth,
+            _depth=0,
+            _seen=set(),
+            _measured_depth=None,
+            _no_leaf_shorten=True,
+            _leaf_max=None,
+            _driver=False,
         )
+        if len(full) <= max_length:
+            return full
+        # Binary search the largest leaf budget that fits
+        low, high = 8, max(8, min(max_length, 512))
+        best = None
+        for _ in range(12):
+            if low > high:
+                break
+            mid = (low + high) // 2
+            s = pudb_stringifier(
+                obj,
+                max_length=max_length,
+                max_items=max_items,
+                max_depth=max_depth,
+                _depth=0,
+                _seen=set(),
+                _measured_depth=None,
+                _no_leaf_shorten=False,
+                _leaf_max=mid,
+                _driver=False,
+            )
+            if len(s) < max_length:
+                best = s
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best is None:
+            # Fallback: truncate full repr
+            return _truncate_middle(full, max_length - 1 if max_length > 1 else 0)
+        return best
+
+    # From here on, it's a single-pass formatter using given leaf budget
+    @print_input_output
+    def _inner(
+        obj: Any,
+        *,
+        max_length: int,
+        max_items: int,
+        max_depth: int,
+        _depth: int,
+        _seen: set[int] | None,
+        _measured_depth: int | None,
+        _no_leaf_shorten: bool,
+        _leaf_max: int | None,
+        _driver: bool,
+    ) -> str:
+        # Cycle protection (skip primitives to avoid false positives on reused ints, etc.)
+        if _seen is None:
+            _seen = set()
+        oid = id(obj)
+        if not _is_acyclic_primitive(obj):
+            if oid in _seen:
+                return "..."
+            _seen.add(oid)
+
+        # Leaf width/budget
+        leaf_width = _leaf_max if _leaf_max is not None else 32
+
+        # Depth cap
+        if _depth >= max_depth:
+            r = repr(obj)
+            part = (
+                _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
+                if (r.startswith("<") and r.endswith(">"))
+                else _truncate_middle(r, leaf_width)
+            )
+            if _depth == 0 and len(part) > max_length:
+                part = _truncate_middle(part, max_length)
+            return part
+
+        # Primitives
+        if obj is None or isinstance(obj, (bool, int, float, complex)):
+            return _cap_root(repr(obj), max_length=max_length, depth=_depth)
+
+        # Strings / bytes
+        if isinstance(obj, str):
+            if _no_leaf_shorten:
+                return _cap_root(repr(obj), max_length=max_length, depth=_depth)
+            return _cap_root(
+                _short_str_keep_quotes(obj, leaf_width),
+                max_length=max_length,
+                depth=_depth,
+            )
+        if isinstance(obj, (bytes, bytearray)):
+            if _no_leaf_shorten:
+                return _cap_root(repr(bytes(obj)), max_length=max_length, depth=_depth)
+            return _cap_root(
+                _short_bytes_keep_prefix(bytes(obj), leaf_width),
+                max_length=max_length,
+                depth=_depth,
+            )
+
+        # Paths
+        if isinstance(obj, pathlib.PurePath):
+            if _no_leaf_shorten:
+                return _cap_root(repr(obj), max_length=max_length, depth=_depth)
+            return _cap_root(
+                _short_path(obj, leaf_width, keep_last_segment=True),
+                max_length=max_length,
+                depth=_depth,
+            )
+
+        # Enums
+        if isinstance(obj, enum.Enum):
+            r = repr(obj)
+            if _no_leaf_shorten or len(r) <= leaf_width:
+                return _cap_root(r, max_length=max_length, depth=_depth)
+            # otherwise shorten to class only
+            return _cap_root(
+                f"<{type(obj).__name__}...>", max_length=max_length, depth=_depth
+            )
+
+        # Functions/methods/modules (angle-bracket-y reprs)
+        if isinstance(
+            obj,
+            (
+                types.FunctionType,
+                types.BuiltinFunctionType,
+                types.MethodType,
+                types.BuiltinMethodType,
+                types.ModuleType,
+            ),
+        ):
+            return _cap_root(
+                repr(obj)
+                if _no_leaf_shorten
+                else _short_angle_brackets(
+                    repr(obj), max_inner_len=max(8, leaf_width // 2)
+                ),
+                max_length=max_length,
+                depth=_depth,
+            )
+
+        # Dataclasses
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            cls = type(obj).__name__
+            parts = []
+            for f in dataclasses.fields(obj):
+                try:
+                    v = getattr(obj, f.name)
+                except Exception:
+                    v = "<error>"
+                parts.append(
+                    f"{f.name}="
+                    + pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            inner = ", ".join(parts)
+            return _cap_root(f"{cls}({inner})", max_length=max_length, depth=_depth)
+
+        # Namedtuple
+        if _is_namedtuple(obj):
+            cls = type(obj).__name__
+            parts = []
+            for name in obj._fields:
+                v = getattr(obj, name)
+                parts.append(
+                    f"{name}="
+                    + pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            return _cap_root(
+                f"{cls}(" + ", ".join(parts) + ")", max_length=max_length, depth=_depth
+            )
+
+        # Pydantic BaseModel (v1 and v2)
+        if _HAVE_PYDANTIC and isinstance(obj, _PydanticBaseModel):  # type: ignore[arg-type]
+            cls_type = type(obj)
+            cls = cls_type.__name__
+            # Determine field order for v1/v2 using the class to avoid deprecation warnings on instances.
+            if hasattr(cls_type, "model_fields"):
+                names = list(cls_type.model_fields.keys())  # pydantic v2
+            elif hasattr(cls_type, "__fields__"):
+                names = list(cls_type.__fields__.keys())  # pydantic v1
+            else:
+                names = sorted(k for k in dir(obj) if not k.startswith("_"))
+            parts = []
+            for name in names:
+                try:
+                    v = getattr(obj, name)
+                except Exception:
+                    v = "<error>"
+                parts.append(
+                    f"{name}="
+                    + pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            inner = ", ".join(parts)
+            return f"{cls}({inner})"
+
+        # Pydantic ValidationError summary
+        if (
+            _HAVE_PYDANTIC
+            and _PydanticValidationError is not None
+            and isinstance(obj, _PydanticValidationError)
+        ):  # type: ignore[arg-type]
+            n = 0
+            try:
+                errs = obj.errors()  # list-like
+                n = len(errs) if hasattr(errs, "__len__") else 0
+            except Exception:
+                pass
+            return f"<ValidationError {n} errors>"
+
+        # Mapping
+        if isinstance(obj, Mapping):
+            items = []
+            for i, (k, v) in enumerate(obj.items()):
+                if i >= max_items:
+                    items.append("...")
+                    break
+                ks = pudb_stringifier(
+                    k,
+                    max_length=max_length,
+                    max_items=max_items,
+                    max_depth=max_depth,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _measured_depth=_measured_depth,
+                    _no_leaf_shorten=_no_leaf_shorten,
+                    _leaf_max=_leaf_max,
+                    _driver=False,
+                )
+                vs = pudb_stringifier(
+                    v,
+                    max_length=max_length,
+                    max_items=max_items,
+                    max_depth=max_depth,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _measured_depth=_measured_depth,
+                    _no_leaf_shorten=_no_leaf_shorten,
+                    _leaf_max=_leaf_max,
+                    _driver=False,
+                )
+                items.append(f"{ks}: {vs}")
+            return _cap_root(
+                "{" + ", ".join(items) + "}", max_length=max_length, depth=_depth
+            )
+
+        # Sequences (but not str/bytes already handled)
+        if isinstance(obj, list):
+            parts = []
+            for i, v in enumerate(obj):
+                if i >= max_items:
+                    parts.append("...")
+                    break
+                parts.append(
+                    pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            return _cap_root(
+                "[" + ", ".join(parts) + "]", max_length=max_length, depth=_depth
+            )
+
+        if isinstance(obj, tuple):
+            seq = list(obj)
+            parts = []
+            for i, v in enumerate(seq):
+                if i >= max_items:
+                    parts.append("...")
+                    break
+                parts.append(
+                    pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            trailing = "," if len(seq) == 1 else ""
+            return _cap_root(
+                "(" + ", ".join(parts) + trailing + ")",
+                max_length=max_length,
+                depth=_depth,
+            )
+
+        if isinstance(obj, set):
+            if len(obj) == 0:
+                return "set()"
+            seq = list(obj)
+            parts = []
+            for i, v in enumerate(seq):
+                if i >= max_items:
+                    parts.append("...")
+                    break
+                parts.append(
+                    pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            return _cap_root(
+                "{" + ", ".join(parts) + "}", max_length=max_length, depth=_depth
+            )
+
+        if isinstance(obj, frozenset):
+            if len(obj) == 0:
+                return "frozenset()"
+            seq = list(obj)
+            parts = []
+            for i, v in enumerate(seq):
+                if i >= max_items:
+                    parts.append("...")
+                    break
+                parts.append(
+                    pudb_stringifier(
+                        v,
+                        max_length=max_length,
+                        max_items=max_items,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _seen=_seen,
+                        _measured_depth=_measured_depth,
+                        _no_leaf_shorten=_no_leaf_shorten,
+                        _leaf_max=_leaf_max,
+                        _driver=False,
+                    )
+                )
+            return _cap_root(
+                "frozenset({" + ", ".join(parts) + "})",
+                max_length=max_length,
+                depth=_depth,
+            )
+
+        # Fallback
+        r = repr(obj)
+        if _no_leaf_shorten or len(r) <= leaf_width:
+            part = r
+        else:
+            part = (
+                _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
+                if (r.startswith("<") and r.endswith(">"))
+                else _truncate_middle(r, leaf_width)
+            )
         if _depth == 0 and len(part) > max_length:
             part = _truncate_middle(part, max_length)
         return part
 
-    # Primitives
-    if obj is None or isinstance(obj, (bool, int, float, complex)):
-        return _cap_root(repr(obj), max_length=max_length, depth=_depth)
-
-    # Strings / bytes
-    if isinstance(obj, str):
-        return _cap_root(
-            _short_str_keep_quotes(obj, leaf_width), max_length=max_length, depth=_depth
-        )
-    if isinstance(obj, (bytes, bytearray)):
-        return _cap_root(
-            _short_bytes_keep_prefix(bytes(obj), leaf_width),
-            max_length=max_length,
-            depth=_depth,
-        )
-
-    # Paths
-    if isinstance(obj, pathlib.PurePath):
-        return _cap_root(
-            _short_path(obj, leaf_width, keep_last_segment=False),
-            max_length=max_length,
-            depth=_depth,
-        )
-
-    # Enums
-    if isinstance(obj, enum.Enum):
-        return _cap_root(
-            f"<{type(obj).__name__}...>", max_length=max_length, depth=_depth
-        )
-
-    # Functions/methods/modules (angle-bracket-y reprs)
-    if isinstance(
+    return _inner(
         obj,
-        (
-            types.FunctionType,
-            types.BuiltinFunctionType,
-            types.MethodType,
-            types.BuiltinMethodType,
-            types.ModuleType,
-        ),
-    ):
-        return _cap_root(
-            _short_angle_brackets(repr(obj), max_inner_len=max(8, leaf_width // 2)),
-            max_length=max_length,
-            depth=_depth,
-        )
-
-    # Dataclasses
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        cls = type(obj).__name__
-        parts = []
-        for f in dataclasses.fields(obj):
-            try:
-                v = getattr(obj, f.name)
-            except Exception:
-                v = "<error>"
-            parts.append(
-                f"{f.name}="
-                + pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        inner = ", ".join(parts)
-        return _cap_root(f"{cls}({inner})", max_length=max_length, depth=_depth)
-
-    # Namedtuple
-    if _is_namedtuple(obj):
-        cls = type(obj).__name__
-        parts = []
-        for name in obj._fields:
-            v = getattr(obj, name)
-            parts.append(
-                f"{name}="
-                + pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        return _cap_root(
-            f"{cls}(" + ", ".join(parts) + ")", max_length=max_length, depth=_depth
-        )
-
-    # Pydantic BaseModel (v1 and v2)
-    if _HAVE_PYDANTIC and isinstance(obj, _PydanticBaseModel):  # type: ignore[arg-type]
-        cls_type = type(obj)
-        cls = cls_type.__name__
-        # Determine field order for v1/v2 using the class to avoid deprecation warnings on instances.
-        if hasattr(cls_type, "model_fields"):
-            names = list(cls_type.model_fields.keys())  # pydantic v2
-        elif hasattr(cls_type, "__fields__"):
-            names = list(cls_type.__fields__.keys())  # pydantic v1
-        else:
-            names = sorted(k for k in dir(obj) if not k.startswith("_"))
-        parts = []
-        for name in names:
-            try:
-                v = getattr(obj, name)
-            except Exception:
-                v = "<error>"
-            parts.append(
-                f"{name}="
-                + pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        inner = ", ".join(parts)
-        return f"{cls}({inner})"
-
-    # Pydantic ValidationError summary
-    if (
-        _HAVE_PYDANTIC
-        and _PydanticValidationError is not None
-        and isinstance(obj, _PydanticValidationError)
-    ):  # type: ignore[arg-type]
-        n = 0
-        try:
-            errs = obj.errors()  # list-like
-            n = len(errs) if hasattr(errs, "__len__") else 0
-        except Exception:
-            pass
-        return f"<ValidationError {n} errors>"
-
-    # Mapping
-    if isinstance(obj, Mapping):
-        items = []
-        for i, (k, v) in enumerate(obj.items()):
-            if i >= max_items:
-                items.append("...")
-                break
-            ks = pudb_stringifier(
-                k,
-                max_length=max_length,
-                max_items=max_items,
-                max_depth=max_depth,
-                _depth=_depth + 1,
-                _seen=_seen,
-                _measured_depth=_measured_depth,
-            )
-            vs = pudb_stringifier(
-                v,
-                max_length=max_length,
-                max_items=max_items,
-                max_depth=max_depth,
-                _depth=_depth + 1,
-                _seen=_seen,
-                _measured_depth=_measured_depth,
-            )
-            items.append(f"{ks}: {vs}")
-        return _cap_root(
-            "{" + ", ".join(items) + "}", max_length=max_length, depth=_depth
-        )
-
-    # Sequences (but not str/bytes already handled)
-    if isinstance(obj, list):
-        parts = []
-        for i, v in enumerate(obj):
-            if i >= max_items:
-                parts.append("...")
-                break
-            parts.append(
-                pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        return _cap_root(
-            "[" + ", ".join(parts) + "]", max_length=max_length, depth=_depth
-        )
-
-    if isinstance(obj, tuple):
-        seq = list(obj)
-        parts = []
-        for i, v in enumerate(seq):
-            if i >= max_items:
-                parts.append("...")
-                break
-            parts.append(
-                pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        trailing = "," if len(seq) == 1 else ""
-        return _cap_root(
-            "(" + ", ".join(parts) + trailing + ")", max_length=max_length, depth=_depth
-        )
-
-    if isinstance(obj, set):
-        if len(obj) == 0:
-            return "set()"
-        seq = list(obj)
-        parts = []
-        for i, v in enumerate(seq):
-            if i >= max_items:
-                parts.append("...")
-                break
-            parts.append(
-                pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        return _cap_root(
-            "{" + ", ".join(parts) + "}", max_length=max_length, depth=_depth
-        )
-
-    if isinstance(obj, frozenset):
-        if len(obj) == 0:
-            return "frozenset()"
-        seq = list(obj)
-        parts = []
-        for i, v in enumerate(seq):
-            if i >= max_items:
-                parts.append("...")
-                break
-            parts.append(
-                pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                )
-            )
-        return _cap_root(
-            "frozenset({" + ", ".join(parts) + "})", max_length=max_length, depth=_depth
-        )
-
-    # Fallback
-    r = repr(obj)
-    part = (
-        _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
-        if (r.startswith("<") and r.endswith(">"))
-        else _truncate_middle(r, leaf_width)
+        max_length=max_length,
+        max_items=max_items,
+        max_depth=max_depth,
+        _depth=_depth,
+        _seen=_seen,
+        _measured_depth=_measured_depth,
+        _no_leaf_shorten=_no_leaf_shorten,
+        _leaf_max=_leaf_max,
+        _driver=_driver,
     )
-    if _depth == 0 and len(part) > max_length:
-        part = _truncate_middle(part, max_length)
-    return part
 
 
 def run_test() -> None:
@@ -557,9 +693,11 @@ def run_test() -> None:
     e = Entry(path=long_path, name="a.py", kind=NodeKind.FILE)
     s = pudb_stringifier(e)
     assert s.startswith("Entry(")
-    assert "PurePosixPath('/private/...')" in s, s
+    assert "PurePosixPath(" in s and "..." in s and "a.py" in s, s
     assert "name='a.py'" in s, s
-    assert "kind=<NodeKind...>" in s, s
+    assert "kind=<NodeKind" in s, s
+    # length behavior: original > 160 so target within [140, 160)
+    assert 140 <= len(s) < 160, len(s)
 
     # 2) Lambda/function angle-bracket repr
     lf = pudb_stringifier(lambda x: x)
@@ -568,7 +706,7 @@ def run_test() -> None:
     # 3) Mapping truncation
     d = {i: i for i in range(10)}
     md = pudb_stringifier(d, max_items=3)
-    assert md.startswith("{") and "..." in md, md
+    assert md.startswith("{") and "..." in md and "0: 0" in md, md
 
     # 4) Bytes
     b = pudb_stringifier(b"abcdefghijklmnopqrstuvwxyz", max_length=16)
@@ -585,8 +723,6 @@ def run_test() -> None:
     pt = Point("hello" * 20, 123)
     nt = pudb_stringifier(pt, max_length=20)
     assert nt.startswith("Point(") and "x='hellohe...".split()[0] or True
-
-    print("All tests passed.")
 
     # 7) Empty set and frozenset, tuple singleton
     assert pudb_stringifier(set()) == "set()"
@@ -670,7 +806,7 @@ def run_test() -> None:
             return "<Angle foo bar baz>"
 
     ang = pudb_stringifier(Angle())
-    assert ang.startswith("<Angle") and ang.endswith("...>"), ang
+    assert ang.startswith("<Angle") and ang.endswith(">"), ang
 
     # 20) Pydantic BaseModel (if available)
     try:
@@ -773,6 +909,18 @@ def run_test() -> None:
     deep_s = pudb_stringifier(nested, max_length=max_len_deep, max_depth=10)
     assert len(deep_s) <= max_len_deep, (len(deep_s), deep_s)
     assert deep_s[0] == "{" and deep_s[-1] == "}", deep_s
+
+    # 22) No shortening if full fits (flat)
+    s120 = "z" * 120
+    full_flat = pudb_stringifier(s120)  # default max_length=160
+    assert "..." not in full_flat and len(full_flat) <= 160, full_flat
+
+    # 23) No shortening if full fits (deep)
+    small_nested = {"a": {"b": {"c": {"d": "e"}}}}
+    full_deep = pudb_stringifier(small_nested)
+    assert "..." not in full_deep and len(full_deep) <= 160, full_deep
+
+    print("All tests passed.")
 
 
 if __name__ == "__main__":
