@@ -49,9 +49,7 @@ def _short_bytes_keep_prefix(b: bytes, max_len: int) -> str:
     return "b" + repr(inner)
 
 
-def _short_path(
-    p: pathlib.PurePath, max_len: int, keep_last_segment: bool = False
-) -> str:
+def _short_path(p: pathlib.PurePath, max_len: int) -> str:
     s = str(p)
     inner = s if len(s) <= max_len else _truncate_middle(s, max_len)
     return f"{type(p).__name__}(" + repr(inner) + ")"
@@ -104,106 +102,13 @@ def _is_acyclic_primitive(obj: Any) -> bool:
     )
 
 
-def _measure_depth(
-    obj: Any,
-    *,
-    max_depth: int,
-    _depth: int = 0,
-    _seen: set[int] | None = None,
-) -> int:
-    if _seen is None:
-        _seen = set()
-    oid = id(obj)
-    if oid in _seen:
-        return 0
-    _seen.add(oid)
-
-    if _depth >= max_depth:
-        return 0
-
-    # Terminal types
-    if obj is None or isinstance(
-        obj,
-        (bool, int, float, complex, str, bytes, bytearray, enum.Enum, pathlib.PurePath),
-    ):
-        return 0
-    if isinstance(
-        obj,
-        (
-            types.FunctionType,
-            types.BuiltinFunctionType,
-            types.MethodType,
-            types.BuiltinMethodType,
-            types.ModuleType,
-        ),
-    ):
-        return 0
-
-    # Dataclass
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        depths = []
-        for f in dataclasses.fields(obj):
-            try:
-                v = getattr(obj, f.name)
-            except Exception:
-                continue
-            depths.append(
-                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
-            )
-        return 1 + (max(depths) if depths else 0)
-
-    # Pydantic BaseModel
-    if _HAVE_PYDANTIC and isinstance(obj, _PydanticBaseModel):  # type: ignore[arg-type]
-        cls_type = type(obj)
-        if hasattr(cls_type, "model_fields"):
-            names = list(cls_type.model_fields.keys())
-        elif hasattr(cls_type, "__fields__"):
-            names = list(cls_type.__fields__.keys())
-        else:
-            names = []
-        depths = []
-        for name in names:
-            try:
-                v = getattr(obj, name)
-            except Exception:
-                continue
-            depths.append(
-                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
-            )
-        return 1 + (max(depths) if depths else 0)
-
-    # Namedtuple
-    if _is_namedtuple(obj):
-        depths = []
-        for name in getattr(obj, "_fields", []):
-            try:
-                v = getattr(obj, name)
-            except Exception:
-                continue
-            depths.append(
-                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
-            )
-        return 1 + (max(depths) if depths else 0)
-
-    # Mapping
-    if isinstance(obj, Mapping):
-        depths = []
-        for _, v in obj.items():
-            depths.append(
-                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
-            )
-        return 1 + (max(depths) if depths else 0)
-
-    # Sequences
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        depths = []
-        for v in obj:
-            depths.append(
-                _measure_depth(v, max_depth=max_depth, _depth=_depth + 1, _seen=_seen)
-            )
-        return 1 + (max(depths) if depths else 0)
-
-    return 0
+def _repr_leaf(obj: Any, leaf_width: int, no_shorten: bool) -> str:
+    r = repr(obj)
+    if no_shorten or len(r) <= leaf_width:
+        return r
+    if r.startswith("<") and r.endswith(">"):
+        return _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
+    return _truncate_middle(r, leaf_width)
 
 
 if VERBOSE or VERY_VERBOSE:
@@ -248,7 +153,6 @@ def pudb_stringifier(
     max_depth: int = 3,
     _depth: int = 0,
     _seen: set[int] | None = None,
-    _measured_depth: int | None = None,
     _no_leaf_shorten: bool = False,
     _leaf_max: int | None = None,
     _driver: bool = True,
@@ -262,7 +166,6 @@ def pudb_stringifier(
             max_depth=max_depth,
             _depth=0,
             _seen=set(),
-            _measured_depth=None,
             _no_leaf_shorten=True,
             _leaf_max=None,
             _driver=False,
@@ -270,11 +173,11 @@ def pudb_stringifier(
         if len(full) <= max_length:
             return full
         # Binary search the largest leaf budget that fits
-        low, high = 8, max(8, min(max_length, 512))
+        LEAF_BUDGET_MIN = 8
+        LEAF_BUDGET_MAX = max(LEAF_BUDGET_MIN, min(max_length, 512))
+        low, high = LEAF_BUDGET_MIN, LEAF_BUDGET_MAX
         best = None
-        for _ in range(12):
-            if low > high:
-                break
+        while low <= high:
             mid = (low + high) // 2
             s = pudb_stringifier(
                 obj,
@@ -283,7 +186,6 @@ def pudb_stringifier(
                 max_depth=max_depth,
                 _depth=0,
                 _seen=set(),
-                _measured_depth=None,
                 _no_leaf_shorten=False,
                 _leaf_max=mid,
                 _driver=False,
@@ -308,7 +210,6 @@ def pudb_stringifier(
         max_depth: int,
         _depth: int,
         _seen: set[int] | None,
-        _measured_depth: int | None,
         _no_leaf_shorten: bool,
         _leaf_max: int | None,
         _driver: bool,
@@ -325,17 +226,45 @@ def pudb_stringifier(
         # Leaf width/budget
         leaf_width = _leaf_max if _leaf_max is not None else 32
 
+        # Helpers to reduce duplication
+        def cap(s: str) -> str:
+            return _cap_root(s, max_length=max_length, depth=_depth)
+
+        def rec(v: Any) -> str:
+            return pudb_stringifier(
+                v,
+                max_length=max_length,
+                max_items=max_items,
+                max_depth=max_depth,
+                _depth=_depth + 1,
+                _seen=_seen,
+                _no_leaf_shorten=_no_leaf_shorten,
+                _leaf_max=_leaf_max,
+                _driver=False,
+            )
+
+        def fmt_seq(seq, open_, close_, trailing: str = "") -> str:
+            head = list(seq)[:max_items]
+            items = [rec(v) for v in head]
+            if len(list(seq)) > max_items:
+                items.append("...")
+            return cap(f"{open_}{', '.join(items)}{trailing}{close_}")
+
+        def fmt_fields(cls_name: str, names: list[str], get) -> str:
+            parts: list[str] = []
+            for name in names:
+                try:
+                    v = get(name)
+                except Exception:
+                    v = "<error>"
+                parts.append(f"{name}=" + rec(v))
+            return cap(f"{cls_name}(" + ", ".join(parts) + ")")
+
         # Depth cap
         if _depth >= max_depth:
-            r = repr(obj)
-            part = (
-                _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
-                if (r.startswith("<") and r.endswith(">"))
-                else _truncate_middle(r, leaf_width)
-            )
-            if _depth == 0 and len(part) > max_length:
-                part = _truncate_middle(part, max_length)
-            return part
+            # Depth cap applies in both phases; always allow leaf shortening here
+            part = _repr_leaf(obj, leaf_width, no_shorten=False)
+            return cap(part)
 
         # Primitives
         if obj is None or isinstance(obj, (bool, int, float, complex)):
@@ -344,30 +273,18 @@ def pudb_stringifier(
         # Strings / bytes
         if isinstance(obj, str):
             if _no_leaf_shorten:
-                return _cap_root(repr(obj), max_length=max_length, depth=_depth)
-            return _cap_root(
-                _short_str_keep_quotes(obj, leaf_width),
-                max_length=max_length,
-                depth=_depth,
-            )
+                return cap(repr(obj))
+            return cap(_short_str_keep_quotes(obj, leaf_width))
         if isinstance(obj, (bytes, bytearray)):
             if _no_leaf_shorten:
-                return _cap_root(repr(bytes(obj)), max_length=max_length, depth=_depth)
-            return _cap_root(
-                _short_bytes_keep_prefix(bytes(obj), leaf_width),
-                max_length=max_length,
-                depth=_depth,
-            )
+                return cap(repr(bytes(obj)))
+            return cap(_short_bytes_keep_prefix(bytes(obj), leaf_width))
 
         # Paths
         if isinstance(obj, pathlib.PurePath):
             if _no_leaf_shorten:
-                return _cap_root(repr(obj), max_length=max_length, depth=_depth)
-            return _cap_root(
-                _short_path(obj, leaf_width, keep_last_segment=True),
-                max_length=max_length,
-                depth=_depth,
-            )
+                return cap(repr(obj))
+            return cap(_short_path(obj, leaf_width))
 
         # Enums
         if isinstance(obj, enum.Enum):
@@ -390,67 +307,24 @@ def pudb_stringifier(
                 types.ModuleType,
             ),
         ):
-            return _cap_root(
+            return cap(
                 repr(obj)
                 if _no_leaf_shorten
                 else _short_angle_brackets(
                     repr(obj), max_inner_len=max(8, leaf_width // 2)
-                ),
-                max_length=max_length,
-                depth=_depth,
+                )
             )
 
         # Dataclasses
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             cls = type(obj).__name__
-            parts = []
-            for f in dataclasses.fields(obj):
-                try:
-                    v = getattr(obj, f.name)
-                except Exception:
-                    v = "<error>"
-                parts.append(
-                    f"{f.name}="
-                    + pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
-            inner = ", ".join(parts)
-            return _cap_root(f"{cls}({inner})", max_length=max_length, depth=_depth)
+            names = [f.name for f in dataclasses.fields(obj)]
+            return fmt_fields(cls, names, obj.__getattribute__)
 
         # Namedtuple
         if _is_namedtuple(obj):
             cls = type(obj).__name__
-            parts = []
-            for name in obj._fields:
-                v = getattr(obj, name)
-                parts.append(
-                    f"{name}="
-                    + pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
-            return _cap_root(
-                f"{cls}(" + ", ".join(parts) + ")", max_length=max_length, depth=_depth
-            )
+            return fmt_fields(cls, list(obj._fields), obj.__getattribute__)
 
         # Pydantic BaseModel (v1 and v2)
         if _HAVE_PYDANTIC and isinstance(obj, _PydanticBaseModel):  # type: ignore[arg-type]
@@ -463,29 +337,7 @@ def pudb_stringifier(
                 names = list(cls_type.__fields__.keys())  # pydantic v1
             else:
                 names = sorted(k for k in dir(obj) if not k.startswith("_"))
-            parts = []
-            for name in names:
-                try:
-                    v = getattr(obj, name)
-                except Exception:
-                    v = "<error>"
-                parts.append(
-                    f"{name}="
-                    + pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
-            inner = ", ".join(parts)
-            return f"{cls}({inner})"
+            return fmt_fields(cls, names, obj.__getattribute__)
 
         # Pydantic ValidationError summary
         if (
@@ -503,162 +355,36 @@ def pudb_stringifier(
 
         # Mapping
         if isinstance(obj, Mapping):
-            items = []
+            items: list[str] = []
             for i, (k, v) in enumerate(obj.items()):
                 if i >= max_items:
                     items.append("...")
                     break
-                ks = pudb_stringifier(
-                    k,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                    _no_leaf_shorten=_no_leaf_shorten,
-                    _leaf_max=_leaf_max,
-                    _driver=False,
-                )
-                vs = pudb_stringifier(
-                    v,
-                    max_length=max_length,
-                    max_items=max_items,
-                    max_depth=max_depth,
-                    _depth=_depth + 1,
-                    _seen=_seen,
-                    _measured_depth=_measured_depth,
-                    _no_leaf_shorten=_no_leaf_shorten,
-                    _leaf_max=_leaf_max,
-                    _driver=False,
-                )
-                items.append(f"{ks}: {vs}")
-            return _cap_root(
-                "{" + ", ".join(items) + "}", max_length=max_length, depth=_depth
-            )
+                items.append(f"{rec(k)}: {rec(v)}")
+            return cap("{" + ", ".join(items) + "}")
 
         # Sequences (but not str/bytes already handled)
         if isinstance(obj, list):
-            parts = []
-            for i, v in enumerate(obj):
-                if i >= max_items:
-                    parts.append("...")
-                    break
-                parts.append(
-                    pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
-            return _cap_root(
-                "[" + ", ".join(parts) + "]", max_length=max_length, depth=_depth
-            )
+            return fmt_seq(obj, "[", "]")
 
         if isinstance(obj, tuple):
             seq = list(obj)
-            parts = []
-            for i, v in enumerate(seq):
-                if i >= max_items:
-                    parts.append("...")
-                    break
-                parts.append(
-                    pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
             trailing = "," if len(seq) == 1 else ""
-            return _cap_root(
-                "(" + ", ".join(parts) + trailing + ")",
-                max_length=max_length,
-                depth=_depth,
-            )
+            return fmt_seq(seq, "(", ")", trailing)
 
         if isinstance(obj, set):
             if len(obj) == 0:
                 return "set()"
-            seq = list(obj)
-            parts = []
-            for i, v in enumerate(seq):
-                if i >= max_items:
-                    parts.append("...")
-                    break
-                parts.append(
-                    pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
-            return _cap_root(
-                "{" + ", ".join(parts) + "}", max_length=max_length, depth=_depth
-            )
+            return fmt_seq(list(obj), "{", "}")
 
         if isinstance(obj, frozenset):
             if len(obj) == 0:
                 return "frozenset()"
-            seq = list(obj)
-            parts = []
-            for i, v in enumerate(seq):
-                if i >= max_items:
-                    parts.append("...")
-                    break
-                parts.append(
-                    pudb_stringifier(
-                        v,
-                        max_length=max_length,
-                        max_items=max_items,
-                        max_depth=max_depth,
-                        _depth=_depth + 1,
-                        _seen=_seen,
-                        _measured_depth=_measured_depth,
-                        _no_leaf_shorten=_no_leaf_shorten,
-                        _leaf_max=_leaf_max,
-                        _driver=False,
-                    )
-                )
-            return _cap_root(
-                "frozenset({" + ", ".join(parts) + "})",
-                max_length=max_length,
-                depth=_depth,
-            )
+            return fmt_seq(list(obj), "frozenset({", "})")
 
         # Fallback
-        r = repr(obj)
-        if _no_leaf_shorten or len(r) <= leaf_width:
-            part = r
-        else:
-            part = (
-                _short_angle_brackets(r, max_inner_len=max(8, leaf_width // 2))
-                if (r.startswith("<") and r.endswith(">"))
-                else _truncate_middle(r, leaf_width)
-            )
-        if _depth == 0 and len(part) > max_length:
-            part = _truncate_middle(part, max_length)
-        return part
+        part = _repr_leaf(obj, leaf_width, _no_leaf_shorten)
+        return cap(part)
 
     return _inner(
         obj,
@@ -667,7 +393,6 @@ def pudb_stringifier(
         max_depth=max_depth,
         _depth=_depth,
         _seen=_seen,
-        _measured_depth=_measured_depth,
         _no_leaf_shorten=_no_leaf_shorten,
         _leaf_max=_leaf_max,
         _driver=_driver,
