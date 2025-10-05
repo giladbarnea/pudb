@@ -377,6 +377,18 @@ def pudb_stringifier(
             except Exception:
                 return "<Response <error>>"
 
+        # requests.models.Request
+        if _HAVE_REQUESTS and hasattr(obj, '__class__') and obj.__class__.__name__ == 'Request':
+            try:
+                method = getattr(obj, 'method', 'UNKNOWN')
+                url = getattr(obj, 'url', 'UNKNOWN')
+                headers = getattr(obj, 'headers', {})
+                body = getattr(obj, 'body', None)
+                return fmt_fields("Request", ["method", "url", "headers", "body"], 
+                                lambda attr: {"method": method, "url": url, "headers": headers, "body": body}[attr])
+            except Exception:
+                return "<Request <error>>"
+
         # Mapping
         if isinstance(obj, Mapping):
             items: list[str] = []
@@ -669,10 +681,10 @@ def run_test() -> None:
     full_deep = pudb_stringifier(small_nested)
     assert "..." not in full_deep and len(full_deep) <= 160, full_deep
 
-    # 24) requests.models.Response (if available)
+    # 24) requests.models.Response and Request (if available)
     try:
         import requests
-        from requests.models import Response
+        from requests.models import Response, Request
         
         # Create a mock response object
         class MockResponse(Response):
@@ -697,6 +709,24 @@ def run_test() -> None:
         resp_long = pudb_stringifier(mock_resp, max_length=50)
         assert len(resp_long) <= 50, len(resp_long)
         assert "..." in resp_long, resp_long
+        
+        # Test Request object
+        mock_req = Request('POST', 'https://api.example.com/users', 
+                          headers={'Content-Type': 'application/json'}, 
+                          data='{"name": "John"}')
+        req_s = pudb_stringifier(mock_req)
+        assert req_s.startswith("Request("), req_s
+        assert "method='POST'" in req_s, req_s
+        assert "url='https://api.example.com/users'" in req_s, req_s
+        assert "headers=" in req_s, req_s
+        assert "body=" in req_s, req_s
+        
+        # Test with long body content
+        long_data = '{"data": "' + 'x' * 1000 + '"}'
+        mock_req_long = Request('POST', 'https://api.example.com/large', data=long_data)
+        req_long = pudb_stringifier(mock_req_long, max_length=50)
+        assert len(req_long) <= 50, len(req_long)
+        assert "..." in req_long, req_long
         
     except Exception:
         pass  # requests not available
