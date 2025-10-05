@@ -1,4 +1,0 @@
-filename
-self.extensions
-filters.is_glob(pattern)
-entry

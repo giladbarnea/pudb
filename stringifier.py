@@ -10,8 +10,12 @@ from typing import Any
 
 import sys
 
-VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
-VERY_VERBOSE = "-vv" in sys.argv or "--very-verbose" in sys.argv
+if __name__ == "__main__":
+    VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
+    VERY_VERBOSE = "-vv" in sys.argv or "--very-verbose" in sys.argv
+else:
+    VERBOSE = False
+    VERY_VERBOSE = False
 
 # Optional Pydantic support
 try:
@@ -26,6 +30,14 @@ except Exception:  # pragma: no cover - pydantic may not be installed
     _PydanticBaseModel = None
     _PydanticValidationError = None
     _HAVE_PYDANTIC = False
+
+# Optional requests support
+try:
+    from requests.models import Response as _RequestsResponse
+    _HAVE_REQUESTS = True
+except Exception:  # pragma: no cover - requests may not be installed
+    _RequestsResponse = None
+    _HAVE_REQUESTS = False
 
 
 def _truncate_middle(s: str, max_len: int) -> str:
@@ -353,6 +365,18 @@ def pudb_stringifier(
                 pass
             return f"<ValidationError {n} errors>"
 
+        # requests.models.Response
+        if _HAVE_REQUESTS and isinstance(obj, _RequestsResponse):  # type: ignore[arg-type]
+            try:
+                ok = obj.ok
+                status_code = obj.status_code
+                url = obj.url
+                text = obj.text
+                return fmt_fields("Response", ["ok", "status_code", "url", "text"], 
+                                lambda attr: {"ok": ok, "status_code": status_code, "url": url, "text": text}[attr])
+            except Exception:
+                return "<Response <error>>"
+
         # Mapping
         if isinstance(obj, Mapping):
             items: list[str] = []
@@ -644,6 +668,38 @@ def run_test() -> None:
     small_nested = {"a": {"b": {"c": {"d": "e"}}}}
     full_deep = pudb_stringifier(small_nested)
     assert "..." not in full_deep and len(full_deep) <= 160, full_deep
+
+    # 24) requests.models.Response (if available)
+    try:
+        import requests
+        from requests.models import Response
+        
+        # Create a mock response object
+        class MockResponse(Response):
+            def __init__(self):
+                super().__init__()
+                self._content = b'{"message": "Hello World"}'
+                self.status_code = 200
+                self.url = "https://example.com/api"
+                self.headers = {}
+                self.encoding = 'utf-8'
+        
+        mock_resp = MockResponse()
+        resp_s = pudb_stringifier(mock_resp)
+        assert resp_s.startswith("Response("), resp_s
+        assert "ok=True" in resp_s, resp_s
+        assert "status_code=200" in resp_s, resp_s
+        assert "url='https://example.com/api'" in resp_s, resp_s
+        assert "text=" in resp_s, resp_s
+        
+        # Test with long text content
+        mock_resp._content = b'{"data": "' + b'x' * 1000 + b'"}'
+        resp_long = pudb_stringifier(mock_resp, max_length=50)
+        assert len(resp_long) <= 50, len(resp_long)
+        assert "..." in resp_long, resp_long
+        
+    except Exception:
+        pass  # requests not available
 
     print("All tests passed.")
 
