@@ -372,8 +372,9 @@ def pudb_stringifier(
                 status_code = obj.status_code
                 url = obj.url
                 text = obj.text
-                return fmt_fields("Response", ["ok", "status_code", "url", "text"], 
-                                lambda attr: {"ok": ok, "status_code": status_code, "url": url, "text": text}[attr])
+                reason = getattr(obj, 'reason', '')
+                return fmt_fields("Response", ["ok", "status_code", "url", "text", "reason"], 
+                                lambda attr: {"ok": ok, "status_code": status_code, "url": url, "text": text, "reason": reason}[attr])
             except Exception:
                 return "<Response <error>>"
 
